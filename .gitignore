@@ -21,6 +21,13 @@ adapters/dpo/
 adapters/orpo/
 gguf/
 *.gguf
+
+# Submission Option C: keep adapter config + dpo metrics + small data stubs.
+# Weights (.bin/.safetensors) and large parquet stay ignored.
+!adapters/sft-mini/adapter_config.json
+!adapters/dpo/adapter_config.json
+!adapters/dpo/dpo_metrics.json
+!data/pref/train.parquet
 runs/
 wandb/
 

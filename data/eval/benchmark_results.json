@@ -1,0 +1,26 @@
+{
+  "compute_tier": "T4",
+  "metrics": {
+    "ifeval": {
+      "sft": null,
+      "dpo": null,
+      "note": "lm-eval-harness 0.4.x failed to write parseable results JSON under Transformers v5.5.0"
+    },
+    "gsm8k": {
+      "sft": null,
+      "dpo": null,
+      "note": "same lm-eval JSON parse failure"
+    },
+    "mmlu": {
+      "sft": null,
+      "dpo": null,
+      "note": "same lm-eval JSON parse failure"
+    },
+    "alpaca_eval_lite": {
+      "sft": 0.5,
+      "dpo": 0.54,
+      "delta": 0.04,
+      "note": "100 prompts, gpt-4o-mini judge, random A/B order; DPO win-rate 41/100, ties 26/100"
+    }
+  }
+}

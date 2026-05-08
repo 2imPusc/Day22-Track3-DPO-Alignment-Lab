@@ -53,22 +53,44 @@ assert torch.cuda.is_available()
 # ## 1. Load DPO model + merge adapter
 
 # %%
-from unsloth import FastLanguageModel
+# CRITICAL: load FP16 base (not bnb-4bit). Merging on bnb-4bit produces packed
+# NF4 storage that GGUF converter refuses ("Quant method bitsandbytes not supported").
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name=BASE_MODEL,
-    max_seq_length=MAX_LEN,
-    dtype=None,
-    load_in_4bit=True,
+FP16_BASE = "Qwen/Qwen2.5-3B" if COMPUTE_TIER == "T4" else "Qwen/Qwen2.5-7B"
+
+base = AutoModelForCausalLM.from_pretrained(
+    FP16_BASE,
+    torch_dtype=torch.float16,
+    device_map="cuda:0",
+    low_cpu_mem_usage=True,
 )
+tokenizer = AutoTokenizer.from_pretrained(FP16_BASE)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
+if tokenizer.chat_template is None:
+    try:
+        from unsloth.chat_templates import get_chat_template
+        tokenizer = get_chat_template(tokenizer, chat_template="qwen-2.5")
+    except Exception:
+        tokenizer.chat_template = (
+            "{% for message in messages %}"
+            "{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+        )
 
-# Stack SFT-mini → DPO adapters
+# Stage 1: apply + merge SFT
 SFT_PATH = REPO_ROOT / "adapters" / "sft-mini"
-model = PeftModel.from_pretrained(model, str(SFT_PATH))
-print(f"Loaded SFT-mini adapter from {SFT_PATH}")
+model = PeftModel.from_pretrained(base, str(SFT_PATH))
+model = model.merge_and_unload()
+print("SFT merged into FP16 base")
+
+# Stage 2: apply DPO (will be merged in §2)
+model = PeftModel.from_pretrained(model, str(DPO_PATH))
+print(f"DPO adapter loaded from {DPO_PATH}")
 
 # %% [markdown]
 # > **Note:** The DPO adapter trained in NB3 stacks on top of SFT. To get a fully
@@ -83,19 +105,25 @@ print(f"Loaded SFT-mini adapter from {SFT_PATH}")
 # converter in step 3.
 
 # %%
-# This re-loads the model with both SFT and DPO adapters merged into base weights.
-# Output is FP16 (or BF16 on Ampere+) HF-format weights ready for inference.
-model.save_pretrained_merged(
+merged = model.merge_and_unload()
+merged.save_pretrained(
     str(MERGED_PATH),
-    tokenizer,
-    save_method="merged_16bit",
+    safe_serialization=True,
+    save_original_format=False,
 )
+tokenizer.save_pretrained(str(MERGED_PATH))
 print(f"Saved merged FP16 to {MERGED_PATH}")
 
-# Free GPU memory before GGUF conversion (which spawns a subprocess that needs RAM)
-import gc
+# Verify weight dtype on disk — must be float16/bfloat16, NOT uint8
+from safetensors import safe_open
+shards = sorted(MERGED_PATH.glob("model*.safetensors"))
+with safe_open(shards[0], framework="pt") as f:
+    for k in [k for k in f.keys() if "weight" in k][:3]:
+        t = f.get_tensor(k)
+        print(f"  {k}  dtype={t.dtype}  shape={tuple(t.shape)}")
 
-del model
+import gc
+del model, merged, base
 gc.collect()
 torch.cuda.empty_cache()
 
@@ -107,25 +135,55 @@ torch.cuda.empty_cache()
 # llama.cpp (~3 min) then quantizes (~30 s).
 
 # %%
-# Reload the merged model — Unsloth's GGUF saver expects a live model handle.
-from unsloth import FastLanguageModel as FLM
+# Direct subprocess: bypass Unsloth's GGUF wrapper entirely (it tries to reload
+# merged dir with bnb which re-quantizes). Call llama.cpp converter + quantize bin.
+import subprocess, os
+from pathlib import Path
 
-model, tokenizer = FLM.from_pretrained(
-    model_name=str(MERGED_PATH),
-    max_seq_length=MAX_LEN,
-    dtype=None,
-    load_in_4bit=False,    # already merged; load full precision
-)
+TMP_DIR = Path("/tmp/gguf-work")
+TMP_DIR.mkdir(exist_ok=True)
+GGUF_DIR.mkdir(parents=True, exist_ok=True)
 
-# %%
-# Save GGUF in 1 quantization tier (Q4_K_M). Add more tiers below if you want the
-# +3 "GGUF release published" rigor add-on.
-model.save_pretrained_gguf(
-    str(GGUF_DIR),
-    tokenizer,
-    quantization_method="q4_k_m",
+f16_path = TMP_DIR / "merged.F16.gguf"
+q4_path = GGUF_DIR / "lab22-dpo-Q4_K_M.gguf"
+
+print("Step 1: HF FP16 -> GGUF F16")
+result = subprocess.run([
+    "/usr/bin/python3",
+    "/root/.unsloth/llama.cpp/unsloth_convert_hf_to_gguf.py",
+    "--outfile", str(f16_path),
+    "--outtype", "f16",
+    str(MERGED_PATH),
+], capture_output=True, text=True)
+if result.returncode != 0:
+    print("STDERR:", result.stderr[-2000:])
+    raise RuntimeError(f"hf->gguf failed: rc={result.returncode}")
+print(f"  F16 GGUF: {f16_path.stat().st_size / 1e6:.1f} MB")
+
+print("\nStep 2: GGUF F16 -> Q4_K_M")
+quantize_bin = next(
+    (p for p in [
+        "/root/.unsloth/llama.cpp/build/bin/llama-quantize",
+        "/root/.unsloth/llama.cpp/llama-quantize",
+        "/root/.unsloth/llama.cpp/build/llama-quantize",
+    ] if Path(p).exists()),
+    None,
 )
-print(f"Saved GGUF Q4_K_M to {GGUF_DIR}")
+assert quantize_bin, "llama-quantize binary not found"
+
+result = subprocess.run(
+    [quantize_bin, str(f16_path), str(q4_path), "Q4_K_M"],
+    capture_output=True, text=True,
+)
+if result.returncode != 0:
+    print("STDERR:", result.stderr[-2000:])
+    raise RuntimeError(f"quantize failed: rc={result.returncode}")
+print(f"  Q4_K_M GGUF: {q4_path.stat().st_size / 1e6:.1f} MB")
+
+f16_path.unlink()
+print(f"\nFinal GGUF in {GGUF_DIR}:")
+for p in sorted(GGUF_DIR.glob("*.gguf")):
+    print(f"  {p.name}  {p.stat().st_size / 1e6:.1f} MB")
 
 # %% [markdown]
 # ### 3a. Optional — additional quantization tiers (for the +3 rigor add-on)
